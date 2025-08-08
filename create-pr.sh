@@ -23,10 +23,13 @@ usage() {
     echo "  --repository REPO              Repository name or ID"
     echo "  --organization ORG             Azure DevOps organization"
     echo "  --project PROJECT              Project name"
+    echo "  --proxy PROXY_URL              Proxy URL for HTTP and HTTPS requests"
     echo "  -h, --help                     Show this help message"
     echo ""
     echo "Environment variables:"
     echo "  AZURE_DEVOPS_EXT_PAT          Personal Access Token for authentication"
+    echo "  AZURE_HTTP_PROXY              HTTP proxy URL (optional)"
+    echo "  AZURE_HTTPS_PROXY             HTTPS proxy URL (optional)"
     echo ""
     echo "Examples:"
     echo "  $0 --title \"Add new feature\" --description \"This adds feature X\""
@@ -49,6 +52,7 @@ OPEN_BROWSER=false
 REPOSITORY=""
 ORGANIZATION=""
 PROJECT=""
+PROXY=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -110,6 +114,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --project)
             PROJECT="$2"
+            shift 2
+            ;;
+        --proxy)
+            PROXY="$2"
             shift 2
             ;;
         -h|--help)
@@ -245,12 +253,26 @@ JSON_PAYLOAD="$JSON_PAYLOAD}"
 
 API_URL="https://dev.azure.com/$ORGANIZATION/$PROJECT/_apis/git/repositories/$REPOSITORY/pullrequests?api-version=7.1"
 
+# Set proxy environment variables if --proxy parameter was provided
+if [ -n "$PROXY" ]; then
+    export AZURE_HTTP_PROXY="$PROXY"
+    export AZURE_HTTPS_PROXY="$PROXY"
+fi
+
+CURL_PROXY_ARGS=""
+if [ -n "$AZURE_HTTP_PROXY" ] || [ -n "$AZURE_HTTPS_PROXY" ]; then
+    PROXY_URL="${AZURE_HTTPS_PROXY:-$AZURE_HTTP_PROXY}"
+    CURL_PROXY_ARGS="--proxy $PROXY_URL"
+fi
+
 echo ""
 echo "Making API call to: $API_URL"
 echo "Payload: $JSON_PAYLOAD"
+[ -n "$CURL_PROXY_ARGS" ] && echo "Using proxy settings: $CURL_PROXY_ARGS"
 echo ""
 
 RESPONSE=$(curl -s -w "\n%{http_code}" \
+    $CURL_PROXY_ARGS \
     -X POST \
     -H "Authorization: Basic $(echo -n ":$AZURE_DEVOPS_EXT_PAT" | base64 -w 0)" \
     -H "Content-Type: application/json" \
@@ -291,6 +313,7 @@ if [ "$HTTP_CODE" -eq 201 ]; then
         fi
         
         curl -s \
+            $CURL_PROXY_ARGS \
             -X PATCH \
             -H "Authorization: Basic $(echo -n ":$AZURE_DEVOPS_EXT_PAT" | base64 -w 0)" \
             -H "Content-Type: application/json" \
