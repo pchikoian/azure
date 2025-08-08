@@ -131,15 +131,9 @@ if [ -z "$TITLE" ]; then
     exit 1
 fi
 
-if ! command -v az &> /dev/null; then
-    echo "Error: Azure CLI is not installed. Please install it first."
-    echo "Visit: https://docs.microsoft.com/en-us/cli/azure/install-azure-cli"
+if ! command -v curl &> /dev/null; then
+    echo "Error: curl is not installed. Please install it first."
     exit 1
-fi
-
-if ! az extension show --name azure-devops &> /dev/null; then
-    echo "Azure DevOps extension not found. Installing..."
-    az extension add --name azure-devops
 fi
 
 if ! git rev-parse --is-inside-work-tree &> /dev/null; then
@@ -166,6 +160,30 @@ if [ "$SOURCE_BRANCH" = "$TARGET_BRANCH" ]; then
     exit 1
 fi
 
+if [ -z "$AZURE_DEVOPS_EXT_PAT" ]; then
+    echo "Error: AZURE_DEVOPS_EXT_PAT environment variable is required for authentication"
+    exit 1
+fi
+
+if [ -z "$ORGANIZATION" ]; then
+    echo "Error: Organization is required. Use --organization to specify it."
+    exit 1
+fi
+
+if [ -z "$PROJECT" ]; then
+    echo "Error: Project is required. Use --project to specify it."
+    exit 1
+fi
+
+if [ -z "$REPOSITORY" ]; then
+    REPOSITORY=$(basename $(git remote get-url origin 2>/dev/null) .git 2>/dev/null || echo "")
+    if [ -z "$REPOSITORY" ]; then
+        echo "Error: Could not determine repository name. Please specify with --repository"
+        exit 1
+    fi
+    echo "Using repository: $REPOSITORY"
+fi
+
 echo "Creating pull request..."
 echo "  Title: $TITLE"
 echo "  Source: $SOURCE_BRANCH"
@@ -178,39 +196,119 @@ echo "  Target: $TARGET_BRANCH"
 [ "$AUTO_COMPLETE" = true ] && echo "  Auto-complete: Yes"
 [ "$DELETE_SOURCE_BRANCH" = true ] && echo "  Delete source branch: Yes"
 
-PR_CMD="az repos pr create --title \"$TITLE\" --source-branch \"$SOURCE_BRANCH\" --target-branch \"$TARGET_BRANCH\""
+REVIEWERS_JSON="[]"
+if [ -n "$REVIEWERS" ]; then
+    REVIEWERS_JSON="[]"
+    for reviewer in $REVIEWERS; do
+        if [ "$REVIEWERS_JSON" = "[]" ]; then
+            REVIEWERS_JSON="[{\"id\":\"$reviewer\"}]"
+        else
+            REVIEWERS_JSON="${REVIEWERS_JSON%]}},{\"id\":\"$reviewer\"}]"
+        fi
+    done
+fi
 
-[ -n "$DESCRIPTION" ] && PR_CMD="$PR_CMD --description \"$DESCRIPTION\""
-[ -n "$REVIEWERS" ] && PR_CMD="$PR_CMD --reviewers $REVIEWERS"
-[ -n "$REQUIRED_REVIEWERS" ] && PR_CMD="$PR_CMD --required-reviewers $REQUIRED_REVIEWERS"
-[ -n "$WORK_ITEMS" ] && PR_CMD="$PR_CMD --work-items $WORK_ITEMS"
-[ -n "$REPOSITORY" ] && PR_CMD="$PR_CMD --repository \"$REPOSITORY\""
-[ -n "$ORGANIZATION" ] && PR_CMD="$PR_CMD --organization \"$ORGANIZATION\""
-[ -n "$PROJECT" ] && PR_CMD="$PR_CMD --project \"$PROJECT\""
-[ "$DRAFT" = true ] && PR_CMD="$PR_CMD --draft"
-[ "$AUTO_COMPLETE" = true ] && PR_CMD="$PR_CMD --auto-complete"
-[ "$DELETE_SOURCE_BRANCH" = true ] && PR_CMD="$PR_CMD --delete-source-branch"
-[ "$TRANSITION_WORK_ITEMS" = true ] && PR_CMD="$PR_CMD --transition-work-items"
-[ "$OPEN_BROWSER" = true ] && PR_CMD="$PR_CMD --open"
+REQUIRED_REVIEWERS_JSON="[]"
+if [ -n "$REQUIRED_REVIEWERS" ]; then
+    REQUIRED_REVIEWERS_JSON="[]"
+    for reviewer in $REQUIRED_REVIEWERS; do
+        if [ "$REQUIRED_REVIEWERS_JSON" = "[]" ]; then
+            REQUIRED_REVIEWERS_JSON="[{\"id\":\"$reviewer\",\"isRequired\":true}]"
+        else
+            REQUIRED_REVIEWERS_JSON="${REQUIRED_REVIEWERS_JSON%]}},{\"id\":\"$reviewer\",\"isRequired\":true}]"
+        fi
+    done
+fi
+
+WORK_ITEMS_JSON="[]"
+if [ -n "$WORK_ITEMS" ]; then
+    WORK_ITEMS_JSON="[]"
+    for item in $WORK_ITEMS; do
+        if [ "$WORK_ITEMS_JSON" = "[]" ]; then
+            WORK_ITEMS_JSON="[{\"id\":\"$item\"}]"
+        else
+            WORK_ITEMS_JSON="${WORK_ITEMS_JSON%]}},{\"id\":\"$item\"}]"
+        fi
+    done
+fi
+
+JSON_PAYLOAD="{"
+JSON_PAYLOAD="$JSON_PAYLOAD\"sourceRefName\":\"refs/heads/$SOURCE_BRANCH\","
+JSON_PAYLOAD="$JSON_PAYLOAD\"targetRefName\":\"refs/heads/$TARGET_BRANCH\","
+JSON_PAYLOAD="$JSON_PAYLOAD\"title\":\"$TITLE\""
+[ -n "$DESCRIPTION" ] && JSON_PAYLOAD="$JSON_PAYLOAD,\"description\":\"$DESCRIPTION\""
+[ "$DRAFT" = true ] && JSON_PAYLOAD="$JSON_PAYLOAD,\"isDraft\":true"
+[ "$REVIEWERS_JSON" != "[]" ] && JSON_PAYLOAD="$JSON_PAYLOAD,\"reviewers\":$REVIEWERS_JSON"
+[ "$REQUIRED_REVIEWERS_JSON" != "[]" ] && JSON_PAYLOAD="$JSON_PAYLOAD,\"reviewers\":$REQUIRED_REVIEWERS_JSON"
+[ "$WORK_ITEMS_JSON" != "[]" ] && JSON_PAYLOAD="$JSON_PAYLOAD,\"workItemRefs\":$WORK_ITEMS_JSON"
+JSON_PAYLOAD="$JSON_PAYLOAD}"
+
+API_URL="https://dev.azure.com/$ORGANIZATION/$PROJECT/_apis/git/repositories/$REPOSITORY/pullrequests?api-version=7.1"
 
 echo ""
-echo "Executing: $PR_CMD"
+echo "Making API call to: $API_URL"
+echo "Payload: $JSON_PAYLOAD"
 echo ""
 
-if ! eval $PR_CMD; then
+RESPONSE=$(curl -s -w "\n%{http_code}" \
+    -X POST \
+    -H "Authorization: Basic $(echo -n ":$AZURE_DEVOPS_EXT_PAT" | base64 -w 0)" \
+    -H "Content-Type: application/json" \
+    -d "$JSON_PAYLOAD" \
+    "$API_URL")
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
+
+if [ "$HTTP_CODE" -eq 201 ]; then
+    echo "Pull request created successfully!"
+    
+    PR_ID=$(echo "$RESPONSE_BODY" | grep -o '"pullRequestId":[0-9]*' | cut -d':' -f2)
+    PR_URL=$(echo "$RESPONSE_BODY" | grep -o '"_links":{[^}]*"web":{[^}]*"href":"[^"]*' | sed 's/.*"href":"//')
+    
+    if [ -n "$PR_ID" ]; then
+        echo "PR ID: $PR_ID"
+    fi
+    if [ -n "$PR_URL" ]; then
+        echo "PR URL: $PR_URL"
+        
+        if [ "$OPEN_BROWSER" = true ]; then
+            if command -v xdg-open &> /dev/null; then
+                xdg-open "$PR_URL"
+            elif command -v open &> /dev/null; then
+                open "$PR_URL"
+            else
+                echo "Cannot open browser automatically. Please visit the URL above."
+            fi
+        fi
+    fi
+    
+    if [ "$AUTO_COMPLETE" = true ] && [ -n "$PR_ID" ]; then
+        echo "Setting up auto-complete..."
+        AUTO_COMPLETE_PAYLOAD="{\"autoCompleteSetBy\":{\"id\":\"me\"}}"
+        if [ "$DELETE_SOURCE_BRANCH" = true ]; then
+            AUTO_COMPLETE_PAYLOAD="{\"autoCompleteSetBy\":{\"id\":\"me\"},\"completionOptions\":{\"deleteSourceBranch\":true}}"
+        fi
+        
+        curl -s \
+            -X PATCH \
+            -H "Authorization: Basic $(echo -n ":$AZURE_DEVOPS_EXT_PAT" | base64 -w 0)" \
+            -H "Content-Type: application/json" \
+            -d "$AUTO_COMPLETE_PAYLOAD" \
+            "https://dev.azure.com/$ORGANIZATION/$PROJECT/_apis/git/repositories/$REPOSITORY/pullrequests/$PR_ID?api-version=7.1" > /dev/null
+        echo "Auto-complete enabled."
+    fi
+else
     echo ""
-    echo "Error: Failed to create pull request"
+    echo "Error: Failed to create pull request (HTTP $HTTP_CODE)"
+    echo "Response: $RESPONSE_BODY"
     echo ""
     echo "Possible issues:"
-    echo "  - Not authenticated with Azure DevOps (set AZURE_DEVOPS_EXT_PAT or run 'az devops login')"
+    echo "  - Invalid AZURE_DEVOPS_EXT_PAT token or insufficient permissions"
     echo "  - Invalid organization, project, or repository settings"
     echo "  - Source branch not pushed to remote"
-    echo "  - Insufficient permissions"
     echo "  - PR with same source/target already exists"
-    echo ""
-    echo "Try running 'az devops configure --list' to check your current configuration"
+    echo "  - Invalid reviewer or work item IDs"
     exit 1
 fi
 
-echo ""
-echo "Pull request created successfully!"
